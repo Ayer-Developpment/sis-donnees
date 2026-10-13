@@ -1,0 +1,47 @@
+name: Bornes hydrantes
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  hydrantes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Outils
+        run: sudo apt-get update && sudo apt-get install -y osmium-tool
+      - name: Données OpenStreetMap de la Suisse
+        run: curl -fL --retry 3 -o ch.osm.pbf https://download.geofabrik.de/europe/switzerland-latest.osm.pbf
+      - name: Extraction des bornes hydrantes, réserves et points d'aspiration
+        run: |
+          osmium tags-filter ch.osm.pbf n/emergency=fire_hydrant,water_tank,suction_point,fire_water_pond -o hyd.osm.pbf
+          osmium export hyd.osm.pbf -f geojsonseq -o hyd.geojsonseq
+          ls -lh hyd.geojsonseq
+      - name: Tuiles de 0,5°
+        shell: python
+        run: |
+          import json, math, os
+          tiles = {}
+          K = {'fire_hydrant': 'h', 'water_tank': 't', 'suction_point': 'p', 'fire_water_pond': 'p'}
+          n = 0
+          for line in open('hyd.geojsonseq', encoding='utf-8'):
+              line = line.strip().lstrip('\x1e')
+              if not line: continue
+              f = json.loads(line)
+              if f['geometry']['type'] != 'Point': continue
+              lng, lat = f['geometry']['coordinates']
+              k = K.get(f['properties'].get('emergency'), 'h')
+              key = f'{math.floor(lat / .5)}_{math.floor(lng / .5)}'
+              tiles.setdefault(key, []).append([round(lat * 1e5), round(lng * 1e5), k]); n += 1
+          os.makedirs('out/h', exist_ok=True)
+          for key, arr in tiles.items():
+              json.dump(arr, open(f'out/h/{key}.json', 'w'), separators=(',', ':'))
+          json.dump(sorted(tiles), open('out/h/index.json', 'w'))
+          print(n, 'points dans', len(tiles), 'tuiles')
+      - name: Publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd out && zip -qr hydrants.zip h && ls -lh hydrants.zip
+          gh release delete hydrants --cleanup-tag -y --repo "$GITHUB_REPOSITORY" || true
+          gh release create hydrants hydrants.zip --repo "$GITHUB_REPOSITORY" --title "Bornes hydrantes" --notes "Bornes hydrantes, réserves et points d'aspiration (OpenStreetMap, ODbL)"
