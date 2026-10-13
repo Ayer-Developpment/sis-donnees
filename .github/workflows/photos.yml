@@ -5,13 +5,13 @@ permissions:
   contents: write
 jobs:
   photos:
-    runs-on: ubuntu-latest
-    timeout-minutes: 50
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
     steps:
       - name: Recherche des photos libres d'engins suisses (Wikimedia Commons)
         shell: python
         run: |
-          import json, os, re, time, urllib.parse, urllib.request
+          import json, os, re, time, urllib.error, urllib.parse, urllib.request
           UA = {'User-Agent': 'SIS-Operations-Secours/1.1 (simulateur 112; photos libres)'}
           API = 'https://commons.wikimedia.org/w/api.php'
 
@@ -77,39 +77,41 @@ jobs:
           MAXP = {'VD': 40, 'FR': 40, 'GE': 15, 'VS': 15, 'NE': 15}
 
           OK = re.compile(r'^(CC BY(-SA)? ?\d|CC0|Public domain|PD)', re.I)
+          T0 = time.time(); BUDGET = 38 * 60   # on s'arrête de chercher à temps pour publier ce qui a été trouvé
           def get(params):
-              u = API + '?' + urllib.parse.urlencode({**params, 'format': 'json', 'formatversion': 2})
-              for i in range(4):
+              u = API + '?' + urllib.parse.urlencode({**params, 'format': 'json', 'formatversion': 2, 'maxlag': 5})
+              for i in range(3):
                   try:
-                      with urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=30) as r: return json.load(r)
-                  except Exception: time.sleep(2 + i * 3)
+                      with urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=25) as r: return json.load(r)
+                  except urllib.error.HTTPError as e:
+                      time.sleep(int(e.headers.get('Retry-After') or 5) if e.code in (429, 503) else 2)
+                  except Exception: time.sleep(2)
               return {}
           strip = lambda h: re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', h or '')).strip()
           seen_all = set()
-
+          # une seule requête par recherche : résultats + informations des images (licence, auteur, catégories)
           def harvest(queries, limit, swiss_only=True):
               picks = []
               for q in queries:
-                  if len(picks) >= limit: break
-                  res = get({'action': 'query', 'list': 'search', 'srnamespace': 6, 'srlimit': 30, 'srsearch': q})
-                  titles = [x['title'] for x in res.get('query', {}).get('search', []) if x['title'] not in seen_all]
-                  for k in range(0, len(titles), 20):
-                      info = get({'action': 'query', 'prop': 'imageinfo', 'titles': '|'.join(titles[k:k + 20]), 'iiprop': 'url|size|mime|extmetadata', 'iiurlwidth': 800})
-                      for pg in info.get('query', {}).get('pages', []):
-                          ii = (pg.get('imageinfo') or [{}])[0]; md = ii.get('extmetadata', {})
-                          lic = md.get('LicenseShortName', {}).get('value', '')
-                          if not OK.match(lic) or ii.get('mime') not in ('image/jpeg', 'image/png'): continue
-                          if not ii.get('width') or ii['width'] < ii.get('height', 0) * 1.1: continue
-                          txt = ' '.join([pg['title'], strip(md.get('ImageDescription', {}).get('value', '')), md.get('Categories', {}).get('value', '')])
-                          kt = canton(txt)
-                          if swiss_only and not kt: continue
-                          seen_all.add(pg['title'])
-                          picks.append({'title': pg['title'], 'thumb': ii.get('thumburl'), 'page': ii.get('descriptionurl'), 'license': lic,
-                                        'artist': strip(md.get('Artist', {}).get('value', ''))[:120], 'kt': kt or '', 'q': q,
-                                        'desc': strip(md.get('ImageDescription', {}).get('value', ''))[:200]})
-                          if len(picks) >= limit: break
+                  if len(picks) >= limit or time.time() - T0 > BUDGET: break
+                  res = get({'action': 'query', 'generator': 'search', 'gsrnamespace': 6, 'gsrlimit': 40, 'gsrsearch': q,
+                             'prop': 'imageinfo', 'iiprop': 'url|size|mime|extmetadata', 'iiurlwidth': 800})
+                  pages = sorted(res.get('query', {}).get('pages', []), key=lambda p: p.get('index', 999))
+                  for pg in pages:
+                      if pg['title'] in seen_all: continue
+                      ii = (pg.get('imageinfo') or [{}])[0]; md = ii.get('extmetadata', {})
+                      lic = md.get('LicenseShortName', {}).get('value', '')
+                      if not OK.match(lic) or ii.get('mime') not in ('image/jpeg', 'image/png'): continue
+                      if not ii.get('width') or ii['width'] < ii.get('height', 0) * 1.1: continue
+                      txt = ' '.join([pg['title'], strip(md.get('ImageDescription', {}).get('value', '')), md.get('Categories', {}).get('value', '')])
+                      kt = canton(txt)
+                      if swiss_only and not kt: continue
+                      seen_all.add(pg['title'])
+                      picks.append({'title': pg['title'], 'thumb': ii.get('thumburl'), 'page': ii.get('descriptionurl'), 'license': lic,
+                                    'artist': strip(md.get('Artist', {}).get('value', ''))[:120], 'kt': kt or '', 'q': q,
+                                    'desc': strip(md.get('ImageDescription', {}).get('value', ''))[:200]})
                       if len(picks) >= limit: break
-                  time.sleep(.8)
+                  time.sleep(.3)
               return picks
 
           os.makedirs('out/photos', exist_ok=True)
@@ -118,26 +120,30 @@ jobs:
               for i, p in enumerate(picks):
                   key = f'{prefix}_{i}'
                   try:
-                      with urllib.request.urlopen(urllib.request.Request(p['thumb'], headers=UA), timeout=60) as r: open(f'out/photos/{key}.jpg', 'wb').write(r.read())
+                      with urllib.request.urlopen(urllib.request.Request(p['thumb'], headers=UA), timeout=40) as r: open(f'out/photos/{key}.jpg', 'wb').write(r.read())
                       credits[key] = p
                   except Exception as e: print('échec', key, e)
-                  time.sleep(.4)
+                  time.sleep(.15)
+              json.dump(credits, open('out/photos/credits.json', 'w'), ensure_ascii=False, indent=1)
 
           for ty, (fr, de) in T.items():
-              qs = [f'{w} {r}' for w in fr for r in ROM] + [f'{w} {r}' for w in de for r in DE] + fr + de
+              # recherches ciblées : Vaud et Fribourg d'abord, puis la Suisse en général
+              qs = [f'{fr[0]} Vaud', f'{fr[0]} Fribourg', f'{fr[0]} Suisse', f'{de[0]} Schweiz', f'{de[0]} Freiburg'] + [f'{w} Schweiz' for w in de[1:2]] + [f'{w} Suisse' for w in fr[1:2]]
               picks = harvest(qs, MAXT)
               save(ty, picks)
-              print(ty, len(picks), sorted({p['kt'] for p in picks}))
+              print(ty, len(picks), sorted({p['kt'] for p in picks}), f'{int(time.time() - T0)} s', flush=True)
           for kt, qs in POOL.items():
-              picks = harvest(qs, MAXP[kt])
+              picks = harvest(qs[:6], MAXP[kt])
               save(f'pool_{kt}', picks)
-              print('lot', kt, len(picks))
+              print('lot', kt, len(picks), flush=True)
           json.dump(credits, open('out/photos/credits.json', 'w'), ensure_ascii=False, indent=1)
+          print('total', len(credits), f'{int(time.time() - T0)} s')
 
       - name: Publication
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cd out && zip -qr photos.zip photos && ls -lh photos.zip
+          cd out && test -d photos && zip -qr photos.zip photos && ls -lh photos.zip
           gh release delete photos --cleanup-tag -y --repo "$GITHUB_REPOSITORY" || true
           gh release create photos photos.zip --repo "$GITHUB_REPOSITORY" --title "Photos des engins" --notes "Photos libres (Wikimedia Commons) d'engins suisses, cantons et licences dans credits.json"
