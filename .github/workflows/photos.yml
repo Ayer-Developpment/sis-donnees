@@ -1,0 +1,143 @@
+name: Photos des engins
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  photos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Recherche des photos libres d'engins suisses (Wikimedia Commons)
+        shell: python
+        run: |
+          import json, os, re, time, urllib.parse, urllib.request
+          UA = {'User-Agent': 'SIS-Operations-Secours/1.1 (simulateur 112; photos libres)'}
+          API = 'https://commons.wikimedia.org/w/api.php'
+
+          # cantons : mots qui permettent de reconnaître d'où vient l'engin (titre, description, catégories)
+          KT = {
+            'VD': ['vaud', 'vaudois', 'vaudoise', 'lausanne', 'yverdon', 'montreux', 'vevey', 'nyon', 'morges', 'renens', 'payerne', 'aigle', 'eca vaud', 'sdis', 'spsl', 'gendarmerie vaudoise'],
+            'FR': ['fribourg', 'freiburg', 'fribourgeois', 'fribourgeoise', 'bulle', 'romont', 'morat', 'murten', 'estavayer', 'chatel-st-denis', 'châtel-saint-denis', 'düdingen', 'guin', 'ecab'],
+            'GE': ['genève', 'geneve', 'geneva', 'genf', 'genevois', 'sis genève', 'carouge', 'meyrin', 'vernier'],
+            'VS': ['valais', 'wallis', 'sion', 'sitten', 'martigny', 'monthey', 'sierre', 'brig', 'visp', 'zermatt'],
+            'NE': ['neuchâtel', 'neuchatel', 'neuenburg', 'chaux-de-fonds', 'le locle'],
+            'JU': ['canton du jura', 'jura', 'delémont', 'porrentruy'],
+            'BE': ['bern', 'berne', 'biel', 'bienne', 'thun', 'burgdorf', 'langenthal'],
+            'ZH': ['zürich', 'zurich', 'winterthur', 'schutz & rettung'],
+            'TI': ['ticino', 'tessin', 'lugano', 'bellinzona', 'locarno'],
+            'CH': ['switzerland', 'schweiz', 'suisse', 'svizzera', 'swiss', 'aargau', 'luzern', 'lucerne', 'st. gallen', 'basel', 'bâle', 'graubünden', 'grisons', 'solothurn', 'thurgau', 'schaffhausen', 'zug', 'schwyz', 'uri', 'glarus', 'appenzell', 'obwalden', 'nidwalden', 'kantonspolizei', 'police cantonale', 'rega', 'air zermatt', 'air-glaciers'],
+          }
+          def canton(txt):
+              t = txt.lower()
+              for k, words in KT.items():
+                  if any(w in t for w in words): return k
+              return None
+
+          # mots-clés par engin (français et allemand), combinés avec les régions romandes en priorité
+          T = {
+            'FPT': (['tonne-pompe', 'camion tonne-pompe', 'véhicule de pompiers'], ['Tanklöschfahrzeug', 'TLF Feuerwehr']),
+            'FPTL': (['tonne-pompe légère', 'véhicule de première intervention pompiers'], ['Kleinlöschfahrzeug', 'Kleintanklöschfahrzeug']),
+            'VSR': (['véhicule de désincarcération', 'véhicule de sauvetage routier'], ['Strassenrettungsfahrzeug', 'Rüstwagen Feuerwehr']),
+            'EPA': (['échelle automobile', 'échelle pompiers'], ['Autodrehleiter', 'Drehleiter Feuerwehr']),
+            'BEA': (['bras élévateur articulé', 'nacelle pompiers'], ['Hubretter', 'Teleskopmastbühne', 'Gelenkmastbühne']),
+            'VTU': (['véhicule tous usages pompiers', 'fourgon pompiers'], ['Pionierfahrzeug Feuerwehr', 'Gerätewagen Feuerwehr']),
+            'CCF': (['camion feux de forêt', 'unimog pompiers'], ['Tanklöschfahrzeug Unimog', 'Waldbrand Feuerwehr Fahrzeug']),
+            'CCGC': (['camion-citerne pompiers', 'citerne pompiers'], ['Wassertransporter Feuerwehr', 'Grosstanklöschfahrzeug']),
+            'VLCG': (["véhicule d'officier pompiers", 'voiture de commandement pompiers'], ['Kommandofahrzeug Feuerwehr', 'Kommandowagen Feuerwehr']),
+            'VPC': (['poste de commandement mobile', 'véhicule de commandement'], ['Einsatzleitfahrzeug', 'Einsatzleitwagen Feuerwehr']),
+            'VTP': (['transport de personnel pompiers', 'minibus pompiers'], ['Mannschaftstransportfahrzeug Feuerwehr']),
+            'ARI': (['véhicule appareils respiratoires', 'véhicule ARI pompiers'], ['Atemschutzfahrzeug', 'Gerätewagen Atemschutz']),
+            'CMIC': (['véhicule chimique pompiers', 'défense chimique'], ['Chemiewehr Fahrzeug', 'Gerätewagen Gefahrgut']),
+            'GRIMP': (['sauvetage en hauteur pompiers', 'GRIMP'], ['Höhenrettung Feuerwehr']),
+            'EMB': (['bateau pompiers', 'bateau sauvetage lac'], ['Feuerwehrboot', 'Rettungsboot See']),
+            'PATROUILLE': (['police cantonale voiture', 'gendarmerie voiture', 'voiture de police'], ['Kantonspolizei Patrouillenfahrzeug', 'Polizeiauto']),
+            'MOTO': (['moto police', 'motard police'], ['Polizei Motorrad']),
+            'CIRC': (['police circulation véhicule', 'police route'], ['Verkehrspolizei Fahrzeug']),
+            'FI': (['fourgon police', 'police intervention bus'], ['Polizei Mannschaftswagen', 'Polizei Einsatzfahrzeug']),
+            'CYNO': (['chien de police', 'brigade canine'], ['Polizeihund', 'Diensthund Polizei']),
+            'IJ': (['identité judiciaire véhicule', 'police scientifique'], ['Kriminaltechnik Fahrzeug']),
+            'VEDETTE': (['police du lac bateau', 'brigade du lac'], ['Seepolizei Boot']),
+            'AMB': (['ambulance'], ['Rettungswagen', 'Ambulanz']),
+            'SMUR': (['SMUR', 'véhicule médecin urgence'], ['Notarzteinsatzfahrzeug', 'Notarzt Fahrzeug']),
+            'PMA': (['poste médical avancé', 'véhicule sanitaire catastrophe'], ['Sanitätshilfsstelle', 'Grossraumrettungswagen']),
+            'HELI': (['Rega hélicoptère', 'hélicoptère sauvetage'], ['Rega H145', 'Rega AW169', 'Air Zermatt']),
+          }
+          ROM = ['Vaud', 'Lausanne', 'Fribourg', 'Genève', 'Valais', 'Neuchâtel']
+          DE = ['Schweiz', 'Freiburg', 'Bern', 'Wallis']
+          MAXT = 10           # photos par engin
+          # lots régionaux non classés : je les trie ensuite à la main (camions des casernes vaudoises, fribourgeoises…)
+          POOL = {
+            'VD': ['sapeurs-pompiers Lausanne', 'SDIS Vaud véhicule', 'pompiers Vaud camion', 'ECA Vaud pompiers', 'Gendarmerie vaudoise', 'Police Lausanne voiture', 'ambulance Vaud', 'pompiers Yverdon', 'pompiers Nyon', 'pompiers Riviera Montreux'],
+            'FR': ['sapeurs-pompiers Fribourg', 'pompiers Fribourg camion', 'Feuerwehr Freiburg Schweiz', 'Police cantonale Fribourg', 'Kantonspolizei Freiburg', 'ambulance Fribourg', 'pompiers Bulle', 'Feuerwehr Murten'],
+            'GE': ['SIS Genève pompiers', 'pompiers Genève camion', 'police Genève voiture', 'ambulance Genève'],
+            'VS': ['pompiers Valais', 'Feuerwehr Wallis', 'police Valais', 'ambulance Valais'],
+            'NE': ['pompiers Neuchâtel', 'police Neuchâtel', 'ambulance Neuchâtel'],
+          }
+          MAXP = {'VD': 40, 'FR': 40, 'GE': 15, 'VS': 15, 'NE': 15}
+
+          OK = re.compile(r'^(CC BY(-SA)? ?\d|CC0|Public domain|PD)', re.I)
+          def get(params):
+              u = API + '?' + urllib.parse.urlencode({**params, 'format': 'json', 'formatversion': 2})
+              for i in range(4):
+                  try:
+                      with urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=30) as r: return json.load(r)
+                  except Exception: time.sleep(2 + i * 3)
+              return {}
+          strip = lambda h: re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', h or '')).strip()
+          seen_all = set()
+
+          def harvest(queries, limit, swiss_only=True):
+              picks = []
+              for q in queries:
+                  if len(picks) >= limit: break
+                  res = get({'action': 'query', 'list': 'search', 'srnamespace': 6, 'srlimit': 30, 'srsearch': q})
+                  titles = [x['title'] for x in res.get('query', {}).get('search', []) if x['title'] not in seen_all]
+                  for k in range(0, len(titles), 20):
+                      info = get({'action': 'query', 'prop': 'imageinfo', 'titles': '|'.join(titles[k:k + 20]), 'iiprop': 'url|size|mime|extmetadata', 'iiurlwidth': 800})
+                      for pg in info.get('query', {}).get('pages', []):
+                          ii = (pg.get('imageinfo') or [{}])[0]; md = ii.get('extmetadata', {})
+                          lic = md.get('LicenseShortName', {}).get('value', '')
+                          if not OK.match(lic) or ii.get('mime') not in ('image/jpeg', 'image/png'): continue
+                          if not ii.get('width') or ii['width'] < ii.get('height', 0) * 1.1: continue
+                          txt = ' '.join([pg['title'], strip(md.get('ImageDescription', {}).get('value', '')), md.get('Categories', {}).get('value', '')])
+                          kt = canton(txt)
+                          if swiss_only and not kt: continue
+                          seen_all.add(pg['title'])
+                          picks.append({'title': pg['title'], 'thumb': ii.get('thumburl'), 'page': ii.get('descriptionurl'), 'license': lic,
+                                        'artist': strip(md.get('Artist', {}).get('value', ''))[:120], 'kt': kt or '', 'q': q,
+                                        'desc': strip(md.get('ImageDescription', {}).get('value', ''))[:200]})
+                          if len(picks) >= limit: break
+                      if len(picks) >= limit: break
+                  time.sleep(.8)
+              return picks
+
+          os.makedirs('out/photos', exist_ok=True)
+          credits = {}
+          def save(prefix, picks):
+              for i, p in enumerate(picks):
+                  key = f'{prefix}_{i}'
+                  try:
+                      with urllib.request.urlopen(urllib.request.Request(p['thumb'], headers=UA), timeout=60) as r: open(f'out/photos/{key}.jpg', 'wb').write(r.read())
+                      credits[key] = p
+                  except Exception as e: print('échec', key, e)
+                  time.sleep(.4)
+
+          for ty, (fr, de) in T.items():
+              qs = [f'{w} {r}' for w in fr for r in ROM] + [f'{w} {r}' for w in de for r in DE] + fr + de
+              picks = harvest(qs, MAXT)
+              save(ty, picks)
+              print(ty, len(picks), sorted({p['kt'] for p in picks}))
+          for kt, qs in POOL.items():
+              picks = harvest(qs, MAXP[kt])
+              save(f'pool_{kt}', picks)
+              print('lot', kt, len(picks))
+          json.dump(credits, open('out/photos/credits.json', 'w'), ensure_ascii=False, indent=1)
+
+      - name: Publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd out && zip -qr photos.zip photos && ls -lh photos.zip
+          gh release delete photos --cleanup-tag -y --repo "$GITHUB_REPOSITORY" || true
+          gh release create photos photos.zip --repo "$GITHUB_REPOSITORY" --title "Photos des engins" --notes "Photos libres (Wikimedia Commons) d'engins suisses, cantons et licences dans credits.json"
