@@ -1,0 +1,67 @@
+name: Postes de secours France
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  sites:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Outils
+        run: sudo apt-get update && sudo apt-get install -y osmium-tool
+      - name: Données OpenStreetMap de la France
+        run: curl -fL --retry 3 -o fr.osm.pbf https://download.geofabrik.de/europe/france-latest.osm.pbf
+      - name: Extraction des casernes, gendarmeries, commissariats, SMUR et bases héliportées
+        run: |
+          osmium tags-filter fr.osm.pbf nwr/amenity=fire_station,police nwr/emergency=ambulance_station,air_rescue_service nwr/amenity=hospital -o pois.osm.pbf
+          osmium export pois.osm.pbf -f geojsonseq --geometry-types=point,polygon -o pois.geojsonseq
+          ls -lh pois.geojsonseq
+      - name: Conversion au format du simulateur
+        shell: python
+        run: |
+          import json, re, os
+          def center(g):
+              if g['type'] == 'Point': return g['coordinates']
+              ring = g['coordinates'][0] if g['type'] == 'Polygon' else g['coordinates'][0][0]
+              xs = [p[0] for p in ring]; ys = [p[1] for p in ring]
+              return [sum(xs) / len(xs), sum(ys) / len(ys)]
+          out = []
+          for line in open('pois.geojsonseq', encoding='utf-8'):
+              line = line.strip().lstrip('\x1e')
+              if not line: continue
+              f = json.loads(line); p = f['properties']
+              try: lng, lat = center(f['geometry'])
+              except Exception: continue
+              name = p.get('name') or p.get('official_name') or ''
+              am, em = p.get('amenity'), p.get('emergency')
+              pc, city = p.get('addr:postcode', ''), p.get('addr:city', '')
+              street = ' '.join(x for x in [p.get('addr:housenumber', ''), p.get('addr:street', '')] if x)
+              dpt = pc[:2] if pc else ''
+              t = None
+              if am == 'fire_station':
+                  t = 'vol' if re.search(r'\bCPI\b|première intervention|premiere intervention', name, re.I) else 'feu'
+                  if not name: name = 'Centre d\'incendie et de secours' + (' de ' + city if city else '')
+              elif am == 'police':
+                  if re.search(r'municipale', name + ' ' + p.get('operator', ''), re.I): continue
+                  t = 'pol'
+                  if not name: name = ('Brigade de gendarmerie' if 'gendarmerie' in (p.get('operator', '') + p.get('police:FR', '')).lower() else 'Commissariat de police') + (' de ' + city if city else '')
+              elif em == 'ambulance_station':
+                  t = 'san'; name = name or 'Ambulances' + (' ' + city if city else '')
+              elif em == 'air_rescue_service':
+                  t = 'air'; name = name or 'Base hélicoptère de secours'
+              elif am == 'hospital' and p.get('emergency') == 'yes':
+                  t = 'san'; name = 'SMUR ' + (name or city or 'hôpital')
+              if not t: continue
+              out.append([t, name[:90], round(lat, 5), round(lng, 5), (pc + ' ' + city).strip(), street[:80], dpt])
+          os.makedirs('out', exist_ok=True)
+          json.dump({'src': 'osm', 's': out}, open('out/sites_fr.json', 'w', encoding='utf-8'), ensure_ascii=False, separators=(',', ':'))
+          from collections import Counter
+          print(len(out), 'postes', Counter(r[0] for r in out))
+      - name: Publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd out && zip -q sites_fr.zip sites_fr.json && ls -lh
+          gh release delete sites-fr --cleanup-tag -y --repo "$GITHUB_REPOSITORY" || true
+          gh release create sites-fr sites_fr.zip --repo "$GITHUB_REPOSITORY" --title "Postes de secours France" --notes "Casernes, gendarmeries, commissariats, SMUR et bases héliportées (OpenStreetMap, ODbL)"
