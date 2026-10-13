@@ -1,0 +1,49 @@
+name: Export OSM Suisse
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Outils
+        run: sudo apt-get update && sudo apt-get install -y osmium-tool jq
+
+      - name: OpenStreetMap Suisse (Geofabrik)
+        run: curl -fL --retry 3 -o ch.osm.pbf https://download.geofabrik.de/europe/switzerland-latest.osm.pbf
+
+      - name: Extraction
+        run: |
+          mkdir -p out
+          osmium tags-filter ch.osm.pbf nwr/amenity=fire_station,police,hospital nwr/emergency=ambulance_station,air_rescue_service,mountain_rescue nwr/aeroway=heliport -o pois.osm.pbf
+          osmium export pois.osm.pbf -f geojsonseq --attributes=type,id -o out/ch-pois.geojsonseq
+          osmium tags-filter ch.osm.pbf n/place -o places.osm.pbf
+          osmium export places.osm.pbf -f geojsonseq --attributes=type,id -o out/ch-places.geojsonseq
+          osmium tags-filter ch.osm.pbf w/highway=motorway,motorway_link,trunk,trunk_link,primary,primary_link,secondary,secondary_link,tertiary,tertiary_link,unclassified,residential,living_street -o roads.osm.pbf
+          osmium cat roads.osm.pbf -f opl -o out/ch-roads.opl
+          osmium tags-filter ch.osm.pbf w/waterway=river,canal w/railway=rail,narrow_gauge -o lines.osm.pbf
+          osmium cat lines.osm.pbf -f opl -o out/ch-lines.opl
+          gzip -9 out/*
+          ls -lh out
+
+      - name: Données officielles swisstopo (facultatif)
+        continue-on-error: true
+        run: |
+          get() {
+            url=$(curl -fsSL "https://data.geo.admin.ch/api/stac/v0.9/collections/$1/items?limit=100" | jq -r --arg s "$2" '[.features | sort_by(.id) | reverse | .[].assets[] | select(.href | endswith($s)) | .href][0]')
+            echo "$1 -> $url"
+            [ -n "$url" ] && [ "$url" != "null" ] && curl -fL --retry 3 -o "out/$3" "$url"
+          }
+          get ch.swisstopo-vd.ortschaftenverzeichnis_plz "_2056.csv.zip" plz.csv.zip || true
+          get ch.swisstopo.swissnames3d "_2056.csv.zip" swissnames3d.csv.zip || true
+          get ch.swisstopo.swissboundaries3d "_2056.shp.zip" swissboundaries3d.shp.zip || true
+          ls -lh out
+
+      - name: Publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete donnees --cleanup-tag -y --repo "$GITHUB_REPOSITORY" || true
+          gh release create donnees out/* --repo "$GITHUB_REPOSITORY" --title "Données Suisse" --notes "Export OpenStreetMap (Geofabrik) et swisstopo"
